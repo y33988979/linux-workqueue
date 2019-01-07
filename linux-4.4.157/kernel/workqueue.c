@@ -913,18 +913,44 @@ static bool keep_working(struct worker_pool *pool)
 }
 
 /* Do we need a new worker?  Called from manager. */
+/*
+ * 函数说明：
+ * 判断一个work pool是否需要创建新的worker。
+ *
+ * 函数实现：
+ * 1. worklist非空    ## 代表有工作挂入了wq，需要处理
+ * 2. 当前pool->nr_running为0  ## 代表所有的worker都没有处于运行态，分2种情况：
+ *                                (1)worker还没有被唤醒。
+ *                                (2)work已唤醒，但work—>work_func存在睡眠函数。
+ * 3. 并且可以工作的worker为0  ## 表明所有worker已经都被唤醒，确实需要创建额外的worker
+ * 
+ * 所以，若满足以上3个条件，返回true，表示需要创建新的worker。
+ * 该函数被work manager调用。
+ */
 static bool need_to_create_worker(struct worker_pool *pool)
 {
 	return need_more_worker(pool) && !may_start_working(pool);
 }
 
 /* Do we have too many workers and should some go away? */
+/*
+ * 函数说明：
+ * 策略函数，判断一个work pool中是否存在过多的worker？
+ * 
+ * 函数实现：
+ * 
+ */
 static bool too_many_workers(struct worker_pool *pool)
 {
 	bool managing = pool->flags & POOL_MANAGER_ACTIVE;
 	int nr_idle = pool->nr_idle + managing; /* manager is considered idle */
 	int nr_busy = pool->nr_workers - nr_idle;
 
+	/*
+	 * MAX_IDLE_WORKERS_RATIO = 4
+	 * 空闲的worker数量*4 >= busy worker的数量，则返回真。
+	 * 也就是idle达到busy的4倍时，则认为pool中的worker过多。
+	 */
 	return nr_idle > 2 && (nr_idle - 2) * MAX_IDLE_WORKERS_RATIO >= nr_busy;
 }
 
@@ -2029,13 +2055,30 @@ static void idle_worker_timeout(unsigned long __pool)
 		unsigned long expires;
 
 		/* idle_list is kept in LIFO order, check the last one */
+		/*
+		 * 后进先出，取得最后加入的worker
+		 */
 		worker = list_entry(pool->idle_list.prev, struct worker, entry);
+		/*
+		 * 计算worker满足退出条件的timerout时间
+		 * expires等于上次被激活的时间+5分钟
+		 */
 		expires = worker->last_active + IDLE_WORKER_TIMEOUT;
 
+		/*
+		 * IDLE_WORKER_TIMEOUT=300， ## 5分钟
+		 * 如果worker上一次被激活的时间+IDLE_WORKER_TIMEOUT小于jiffies
+		 * 说明在5分钟期间，worker被重新激活过，所以这里重新修改定时器时间。
+		 * 时间设置为上一次激活的时间+5分钟：
+		 * 也就是expires ##worker->last_active + IDLE_WORKER_TIMEOUT
+		 */
 		if (time_before(jiffies, expires)) {
 			mod_timer(&pool->idle_timer, expires);
 			break;
 		}
+		/*
+		 * 如果在5分钟期限内，worker没有被唤醒，则将worker销毁。
+		 */
 
 		destroy_worker(worker);
 	}
@@ -2220,6 +2263,7 @@ __acquires(&pool->lock)
 	/*
 	 * 如果一个pool是bound类型的(per-cpu的)，则检查当前worker
 	 * 是否在正确的cpu上执行，pool->cpu是pool所绑定的cpu号
+	 * 如果worker没有在指定的cpu上运行，在打印内核警告。
 	 */
 	WARN_ON_ONCE(!(pool->flags & POOL_DISASSOCIATED) &&
 		     raw_smp_processor_id() != pool->cpu);
@@ -2232,7 +2276,7 @@ __acquires(&pool->lock)
 	 */
 	/*
 	 * 单个任务不能同时被多个worker共同处理，所以这里检查是否当前work
-	 * 已经有worker正在处理，如果有，则将延迟到work执行完毕在处理。
+	 * 已经有其他worker正在处理，如果有，则将延迟到work执行完毕在处理。
 	 */
 	collision = find_worker_executing_work(pool, work);
 	if (unlikely(collision)) {
