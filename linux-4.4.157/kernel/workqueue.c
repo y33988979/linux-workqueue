@@ -828,12 +828,30 @@ static bool work_is_canceling(struct work_struct *work)
  *
  * nr_running 变量标识worker真真正正的在运行，因为pool->nr_running在
  * schedule函数中被修改，如果一个work的work_func调用了阻塞函数，则nr_running
- * 会递减。
+ * 会递减。详见：wq_worker_running函数
+ *
+ * 函数实现：
+ * 如果nr_running等于0，则返回true，否则返回false。
+ * 
+ * explain in detail： 
+ * nr_running==0 意味着什么？
+ * 首先nr_running变量由schedule函数进行修改，nr_running代表了真实运行状态。
+ * nr_running等于0的情况：
+ * 1. 当前pool中，所有的worker处于idle状态(没有work需要处理)，那么nr_running自然为0
+ * 2. 当前pool中，一些worker处于idle状态，一些worker处于busy状态（有work要处理），
+ *    但这些work的work_func是阻塞型的，所以执行过程中会使worker睡眠，work_func进入
+ *    睡眠同样是调用schedule函数，所以nr_running会递减。这种情况下nr_running也为0。
+ * 3. 当前pool中，所有worker都处于busy，但是都在处理阻塞型任务，而导致worker睡眠。
+ *    nr_running也为0
+ *
+ * 是否需要创建新的worker？
+ * 通常__need_more_worker需要和may_start_working配合使用，来创建额外的worker。
  *
  * 并发管理：
  * 1. 如果一个带阻塞的work被加入worklist，则__need_more_worker会返回true。
  * 此时在worker_thead线程函数中，会创建新的worker来处理新的任务，从而避免
  * 新加入的work被阻塞，实现workqueue的并发。
+ *
  *
  * 2. 如果一个wq是INTENSIVE类型的，则在处理该wq上的work时，会将nr_running--
  * 并将worker->flags设置成INTENSIVE，nr_running--的目的是让worker不再参与
@@ -877,11 +895,17 @@ static bool need_more_worker(struct worker_pool *pool)
  * 函数实现：
  * 判断一个pool中的idle线程是否为0，如果不为0，则说明有worker可以执行，返回真。
  *
+ * explain in detail:
+ * nr_idle变量代表了pool中的worker确确实实处于空闲状态，需要说明的是：当一个
+ * worker在处理阻塞工作而进入睡眠态时，nr_idle并不会增加。因为work还没有处理
+ * 完成，worker仍处于busy状态，并不是idle状态。
+ *
  * pool->nr_idle 在worker_thread线程函数中增减。
  * 当没有任务处理时调用worker_enter_idle，使nr_idle++，然后主动调用schedule睡眠
  * 当有任务处理时，worker被唤醒，调用worker_leave_idle，使nr_idle--，
  *
  * 所以，如果一个pool->nr_idle等于0，说明当前pool中没有worker可以开始工作。（all busy）
+ * 该函数与need_more_worker配合使用，已确定是否需要创建更多的worker。
  */
 static bool may_start_working(struct worker_pool *pool)
 {
@@ -919,7 +943,7 @@ static bool keep_working(struct worker_pool *pool)
  *
  * 函数实现：
  * 1. worklist非空    ## 代表有工作挂入了wq，需要处理
- * 2. 当前pool->nr_running为0  ## 代表所有的worker都没有处于运行态，分2种情况：
+ * 2. 当前pool->nr_running为0  ## 代表所有的worker都没有处于运行态，几种情况：
  *                                (1)worker还没有被唤醒。
  *                                (2)work已唤醒，但work—>work_func存在睡眠函数。
  * 3. 并且可以工作的worker为0  ## 表明所有worker已经都被唤醒，确实需要创建额外的worker
@@ -1548,6 +1572,10 @@ static void __queue_work(int cpu, struct workqueue_struct *wq,
 
 	rcu_read_lock();
 retry:
+	/*
+	 * 如果cpu == WORK_CPU_UNBOUND，说明工作不需要在指定cpu上运行。
+	 * 通常被schedule_work通用接口所使用。
+	 */
 	if (req_cpu == WORK_CPU_UNBOUND)
 		cpu = raw_smp_processor_id();
 
