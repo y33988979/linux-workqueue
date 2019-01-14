@@ -22,6 +22,20 @@
  * number of these backing pools is dynamic.
  *
  * Please read Documentation/workqueue.txt for details.
+ *
+ * linux内核-工作队列
+ * 工作队列是一种常用的异步执行机制，工作项运行于进程上下文。工作项由
+ * 工人来负责执行，这些工人叫做worker，工作项叫做work。这些worker实际是
+ * 由内核线程所实现的，多个worker组合到一起成为线程池worker_pool，这些
+ * 线程池被所有工作项共享，并且会自我管理。
+ * 系统会在每个cpu上创建2个默认的线程池，一个是高优先级，一个是正常优先级
+ * 分别负责处理高优先级事物和普通事物，这两种worker_pool是和cpu绑定的，不
+ * 允许迁移，另外还有一些unbound类型的worker_pool，他们不和cpu绑定，可以在
+ * 任意的cpu上运行，创建时他们的cpumask是cpu_possible_mask，这些unbound
+ * 类型的线程池的数量是动态，系统会根据线程池的属性不同会创建不同的unbound
+ *  worker_pool，后面会在具体代码中说明。
+ *
+ * 这里只是个短暂的介绍，更多详细的描述可以参看doc/workqueue.txt
  */
 
 #include <linux/export.h>
@@ -69,6 +83,21 @@ enum {
 	 * Note that DISASSOCIATED should be flipped only while holding
 	 * attach_mutex to avoid changing binding state while
 	 * worker_attach_to_pool() is in progress.
+	 */
+
+	/*
+	 * worker_pool的标志
+	 *
+	 * 一个bound型的线程池，有可能关联到它自己的cpu，也可能脱离它的cpu
+	 * 由DISASSOCIATED这个标志位来决定。
+	 * 当work_pool设置了(!DISASSOCIATED)标志，说明work_pool关联了cpu，
+	 * pool中的所有worker都会绑定到固定的cpu上运行，并且这些worker会设置
+	 * %WORKER_UNBOUND标记，同时这些worker会参与并发管理。
+	 *
+	 * 如果work_pool设置了DISASSOCIATED标志，说明这个cpu可能已经下线了。
+	 * 所有的worker将设置%WORKER_UNBOUND标志，并发管理被禁止。worker可能
+	 * 可以在任意的cpu上执行，此时这个pool的表现和unbound型的pool一致。
+	 *
 	 */
 	POOL_MANAGER_ACTIVE	= 1 << 0,	/* being managed */
 	POOL_DISASSOCIATED	= 1 << 2,	/* cpu can't serve workers */
@@ -150,36 +179,129 @@ enum {
 /* struct worker is defined in workqueue_internal.h */
 
 struct worker_pool {
+	/* 自旋锁，保护worker_pool中的数据并发访问*/
 	spinlock_t		lock;		/* the pool lock */
+	/*
+	 * 这个pool所关联的cpu，如果cpu的值为-1，则表示pool是unbound pool
+	 * unbound pool不绑定任何cpu，可以漂移在任意cpu上运行。该字段仅在
+	 * pool初始化、销毁函数被修改，运行过程中通常只有读操作。
+	 */
 	int			cpu;		/* I: the associated cpu */
+	/*
+	 * 这个pool所关联的节点号，for NUMA only
+	 */
 	int			node;		/* I: the associated node ID */
+	/*
+	 * pool的id号，由worker_pool_assign_id函数分配。
+	 */
 	int			id;		/* I: pool ID */
+	/*
+	 * 标志位，标识pool拥有的属性，如：
+	 * POOL_MANAGER_ACTIVE	= 1 << 0, 正在被管理@@
+	 * POOL_DISASSOCIATED	= 1 << 2, 脱离cpu，通常是cpu offline时会设置
+	 */
 	unsigned int		flags;		/* X: flags */
 
+	/*
+	 * 待处理的工作项的链表，标识了所有待处理的任务。
+	 * 当用户使用schedule_work等类似接口时，最终会调用__queue_work排队
+	 * 核心函数，会将work挂入该链表。
+	 * __queue_work的对外常见的api有：
+	 * schedule_work，schedule_work_on
+	 * schedule_delayed_work，schedule_delayed_work_on
+	 * queue_work
+	 */
 	struct list_head	worklist;	/* L: list of pending works */
+	/* 当前pool中工人的数量 */
 	int			nr_workers;	/* L: total number of workers */
 
 	/* nr_idle includes the ones off idle_list for rebinding */
+	/* 当前pool中空闲的工人数量，(这里的idle表示没有work可做) */
 	int			nr_idle;	/* L: currently idle ones */
 
+	/*
+	 * 存放所有idle worker的链表
+	 */
 	struct list_head	idle_list;	/* X: list of idle workers */
+	/*
+	 * idle worker的定时器，因为CMWQ的worker动态管理的，如果空闲的worker
+	 * 长时间没有工作要做，多余的worker会进行销毁。
+	 */
 	struct timer_list	idle_timer;	/* L: worker idle timeout */
+	/*
+	 * 救援线程的定时器，用于内存紧张的时候。
+	 * 如果系统中work工作项负荷较重，这时仍有新任务要处理，同时由于内存
+	 * 紧张无法创建新的worker来处理工作，这时则会将work交给救援线程处理。
+	 *
+	 * 问：救援线程哪来的？
+	 * 答：创建workqueuue时可以一并创建救援线程，需要指定WQ_RECLAIM标志。
+	 * 
+	 * 通常这个救援线程基本用不上场，只是在特殊的情况下会使用。并且需要
+	 * 用户自己创建带WQ_RECLAIM标志的workqueue。
+	 *
+	 * 系统中默认有6种工作队列，都是不带WQ_RECLAIM标志的，也就是不会创建
+	 * 救援线程。
+	 *
+	 * 问：什么时候需要指定WQ_RECLAIM？
+	 * 答：前面已经解释过了，救援线程通常是在内存紧张的时候才会用到，如果
+	 * 你要处理的工作项非常重要，得不到执行会导致严重的系统问题，或者该工
+	 * 作项涉及到了内存回收操作(可以帮助释放额外内存)，那么我们可认为该工
+	 * 作是非常关键的任务，可以创建WQ_RECLAIM类型的工作队列，以保证在工作
+	 * 项在系统内存压力较大的情况下仍可以得到执行。
+	 * 
+	 * 问：创建WQ_RECLAIM类型的workqueue有什么坏处？
+	 * 标识了WQ_RECLAIM标志，创建工作队列时，系统会创建workqueue的时候，
+	 * 一并创建一个后台救援线程，在系统内存空闲的情况下，rescuer thread
+	 * 从来不会唤醒，只会浪费一个kthread的内存资源，无其他影响。
+	 * 可以参见__alloc_workqueue_key接口流程。
+	 */
 	struct timer_list	mayday_timer;	/* L: SOS timer for workers */
 
 	/* a workers is either on busy_hash or idle_list, or the manager */
+	/*
+	 * 正在执行的工作项处于busy状态，该hash表存放busy状态的工作项。
+	 * 一个工作项有3种可能的状态：busy、idle、manager
+	 **/
 	DECLARE_HASHTABLE(busy_hash, BUSY_WORKER_HASH_ORDER);
 						/* L: hash of busy workers */
 
 	/* see manage_workers() for details on the two manager mutexes */
+	/*
+	 * 标识管理者worker
+	 */
 	struct worker		*manager;	/* L: purely informational */
+	/*
+	 * 互斥锁，用于attach/dettach操作
+	 */
 	struct mutex		attach_mutex;	/* attach/detach exclusion */
+	/*
+	 * pool中所有worker的链表
+	 */
 	struct list_head	workers;	/* A: attached workers */
+	/*
+	 * 完成量，用于通知all worker已经和pool解绑
+	 */
 	struct completion	*detach_completion; /* all workers detached */
 
+	/*
+	 * @@
+	 */
 	struct ida		worker_ida;	/* worker IDs for task name */
 
+	/*
+	 * 工作队列属性，主要由3个成员组成：
+	 * nice     ## worker的进程优先级，nice值
+	 * cpumask  ## cpu亲和性位图。
+	 * no_numa  ## 用于控制NUMA亲和性
+	 */
 	struct workqueue_attrs	*attrs;		/* I: worker attributes */
+	/*
+	 * @@
+	 */
 	struct hlist_node	hash_node;	/* PL: unbound_pool_hash node */
+	/*
+	 * unbound pool的参考计数 @@
+	 */
 	int			refcnt;		/* PL: refcnt for unbound pools */
 
 	/*
@@ -187,12 +309,18 @@ struct worker_pool {
 	 * from other CPUs during try_to_wake_up(), put it in a separate
 	 * cacheline.
 	 */
+	/*
+	 * 标识pool中正在运行的worker数量。同时也表示了pool并发级别，
+	 * 如：当nr_running=2时，表示当前有2个work在并发执行。
+	 **/
 	atomic_t		nr_running ____cacheline_aligned_in_smp;
 
 	/*
 	 * Destruction of pool is RCU protected to allow dereferences
 	 * from get_work_pool().
 	 */
+	/*
+	 *@@*/
 	struct rcu_head		rcu;
 } ____cacheline_aligned_in_smp;
 
@@ -202,8 +330,17 @@ struct worker_pool {
  * point to the pwq; thus, pwqs need to be aligned at two's power of the
  * number of flag bits.
  */
+/*
+ * 非常重要的结构体，用于建立workqueue和work_pool之间的关系。
+ */
 struct pool_workqueue {
+	/*
+	 * pool指针，指向对应的worker_pool
+	 */
 	struct worker_pool	*pool;		/* I: the associated pool */
+	/*
+	 * workqueue指针，反向指向对应的wq
+	 */
 	struct workqueue_struct *wq;		/* I: the owning workqueue */
 	int			work_color;	/* L: current color */
 	int			flush_color;	/* L: flushing color */
@@ -213,6 +350,9 @@ struct pool_workqueue {
 	int			nr_active;	/* L: nr of active works */
 	int			max_active;	/* L: max active works */
 	struct list_head	delayed_works;	/* L: delayed works */
+	/*
+	 * wq->pwqs的一个链表节点，
+	 */
 	struct list_head	pwqs_node;	/* WR: node on wq->pwqs */
 	struct list_head	mayday_node;	/* MD: node on wq->maydays */
 
