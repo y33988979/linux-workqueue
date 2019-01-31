@@ -381,10 +381,24 @@ struct wq_device;
  * The externally visible workqueue.  It relays the issued work items to
  * the appropriate worker_pool through its pool_workqueues.
  */
+/*
+ * 工作队列结构体，用于存放工作任务，工作队列内部存在pool_workqueues指针用于找到对应的
+ * worker_pool，CMWQ并发管理功能会根据工作队列的的pool_workqueues指针，来找到合适的
+ * worker_pool，worker_pool被唤醒后，由worker_pool中的空闲线程来处理具体任务。
+ */
 struct workqueue_struct {
+	/*
+	 * 所有关联的pool_workqueues，
+	 */
 	struct list_head	pwqs;		/* WR: all pwqs of this wq */
+	/*
+	 * workqueues链表，全局变量workqueues的一个节点
+	 */
 	struct list_head	list;		/* PR: list of all workqueues */
 
+	/*
+	 * 互斥锁，对wq的结构体变量进行访问时，需要锁保护。
+	 */
 	struct mutex		mutex;		/* protects this wq */
 	int			work_color;	/* WQ: current work color */
 	int			flush_color;	/* WQ: current flush color */
@@ -394,20 +408,52 @@ struct workqueue_struct {
 	struct list_head	flusher_overflow; /* WQ: flush overflow list */
 
 	struct list_head	maydays;	/* MD: pwqs requesting rescue */
+	/*
+	 * 如果创建wq时，指定了WQ_MEM_RECLAIM标记，则会创建一个救援线程。这里worker
+	 * 代表救援线程，如果没有指定WQ_MEM_RECLAIM标记，worker为空。
+	 */
 	struct worker		*rescuer;	/* I: rescue worker */
 
 	int			nr_drainers;	/* WQ: drain in progress */
 	int			saved_max_active; /* WQ: saved pwq max_active */
 
+	/*
+	 * 工作队列的属性结构体，仅用于unbound工作队列
+	 */
 	struct workqueue_attrs	*unbound_attrs;	/* PW: only for unbound wqs */
+	/*
+	 * 默认的pwq指针，仅用于unbound工作队列
+	 */
 	struct pool_workqueue	*dfl_pwq;	/* PW: only for unbound wqs */
 
 #ifdef CONFIG_SYSFS
+	/*
+	 * 如果创建wq时，指定了WQ_SYSFS标记，则会在sysfs文件系统下创建device设备
+	 * workqueue_sysfs_register接口负责注册工作队列到sysfs中，注册后，用户可以
+	 * 在sysfs下看到对应的工作队列属性，改变cpumask等。
+	 */
 	struct wq_device	*wq_dev;	/* I: for sysfs interface */
 #endif
 #ifdef CONFIG_LOCKDEP
+	/*
+	 * @@ 锁调试?
+	 */
 	struct lockdep_map	lockdep_map;
 #endif
+	/*
+	 * 工作队列的名称。系统中默认的工作队列名称都以events开头。如：
+	system_wq = alloc_workqueue("events", 0, 0);
+	system_highpri_wq = alloc_workqueue("events_highpri", WQ_HIGHPRI, 0);
+	system_long_wq = alloc_workqueue("events_long", 0, 0);
+	system_unbound_wq = alloc_workqueue("events_unbound", WQ_UNBOUND,
+					    WQ_UNBOUND_MAX_ACTIVE);
+	system_freezable_wq = alloc_workqueue("events_freezable",
+					      WQ_FREEZABLE, 0);
+	system_power_efficient_wq = alloc_workqueue("events_power_efficient",
+					      WQ_POWER_EFFICIENT, 0);
+	system_freezable_power_efficient_wq = alloc_workqueue("events_freezable_power_efficient",
+						      WQ_FREEZABLE | WQ_POWER_EFFICIENT, 0);
+	 */
 	char			name[WQ_NAME_LEN]; /* I: workqueue name */
 
 	/*
@@ -418,11 +464,28 @@ struct workqueue_struct {
 	struct rcu_head		rcu;
 
 	/* hot fields used during command issue, aligned to cacheline */
+	/*
+	 * 工作队列的flags，每个二进制位代表一种属性，请参看：WQ_xxx 宏定义
+	 */
 	unsigned int		flags ____cacheline_aligned; /* WQ: WQ_* flags */
+	/*
+	 * 工作队列的每CPU pool_workqueue指针，因为系统默认在每个CPU上创建了2个worker_pool。
+	 * cpu_pwqs指针用于指向各CPU上的worker_pool，通过pwq = per_cpu_ptr(wq->cpu_pwqs, cpu);
+	 * 来找到某个cpu对应的pwq，然后通过pwq来找到对应的pool
+	 */
 	struct pool_workqueue __percpu *cpu_pwqs; /* I: per-cpu pwqs */
+	/*
+	 * @@
+	 **/
 	struct pool_workqueue __rcu *numa_pwq_tbl[]; /* PWR: unbound pwqs indexed by node */
 };
 
+/*
+ * 这里定义了很多全局变量，用于管理、访问工作队列
+ */
+/*
+ * 工作队列专用的SLAB缓存
+ */
 static struct kmem_cache *pwq_cache;
 
 static cpumask_var_t *wq_numa_possible_cpumask;
@@ -444,26 +507,61 @@ static DEFINE_MUTEX(wq_pool_mutex);	/* protects pools and workqueues list */
 static DEFINE_SPINLOCK(wq_mayday_lock);	/* protects wq->maydays list */
 static DECLARE_WAIT_QUEUE_HEAD(wq_manager_wait); /* wait for manager to go away */
 
+/* 所有的wq都会加入到这个全局链表中，方便管理，使用each_for_wq可以遍历所有工作队列 */
 static LIST_HEAD(workqueues);		/* PR: list of all workqueues */
 static bool workqueue_freezing;		/* PL: have wqs started freezing? */
 
+/* unbound队列的cpu掩码，当cpu上下线时会对其变更，默认情况下该掩码的值为possible_mask */
 static cpumask_var_t wq_unbound_cpumask; /* PL: low level cpumask for all unbound wqs */
 
 /* the per-cpu worker pools */
+/* 
+ * 每CPU的worker_pool结构，这里的NR_STD_WORKER_POOLS等于2，也就是每个CPU有2个pool，
+ * 一个正常优先级的worker_pool，一个是高优先级的worker_pool
+ */
 static DEFINE_PER_CPU_SHARED_ALIGNED(struct worker_pool [NR_STD_WORKER_POOLS],
 				     cpu_worker_pools);
 
+/* worker_pool的ID，这里使用idr_alloc来分配pool的id */
 static DEFINE_IDR(worker_pool_idr);	/* PR: idr of all pools */
 
 /* PL: hash of all unbound pools keyed by pool->attrs */
 static DEFINE_HASHTABLE(unbound_pool_hash, UNBOUND_POOL_HASH_ORDER);
 
 /* I: attributes used when instantiating standard unbound pools on demand */
+/* unbound工作队列的属性，同样，默认情况下，系统会存在2种unboud pool，正常prio/高prio */
 static struct workqueue_attrs *unbound_std_wq_attrs[NR_STD_WORKER_POOLS];
 
 /* I: attributes used when instantiating ordered pools on demand */
+/* 一个WQ若带有__WQ_ORDERED标记，代表工作队列上的work会排队执行 */
 static struct workqueue_attrs *ordered_wq_attrs[NR_STD_WORKER_POOLS];
 
+/* 
+ * 系统中所有内置的工作队列，在init_workqueues中被创建。
+ *
+ * 1. system_wq:
+ * 该队列是最常使用的工作队列，属性是普通优先级工作队列，kernel中常见api，如schedule_work
+ * schedule_delay_work，schedule_work_on都是将work加入到该system_wq队列中。
+ *
+ * 2. system_highpri_wq:
+ * 该队列和system_wq有些类似，从名称上可以看出来，该队列用于处理高优先级任务，向该队列投递
+ * 任务，会叫醒高优先级的work_pool来处理工作任务。
+ *
+ * 3. system_unbound_wq:
+ * 系统内置的一个unbound队列，对应的kworker线程是不和CPU绑定的。
+ * 
+ * 4. system_freezable_wq:
+ *
+ * 5. system_power_efficient_wq:
+ * 定义为"功率高效"型的工作队列，该队列本身属于UNBOUND队列。
+ *
+ *
+ * 6. system_freezable_power_efficient_wq:
+ *
+ *
+ *
+ *
+ */
 struct workqueue_struct *system_wq __read_mostly;
 EXPORT_SYMBOL(system_wq);
 struct workqueue_struct *system_highpri_wq __read_mostly;
