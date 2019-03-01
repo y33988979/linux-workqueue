@@ -492,16 +492,30 @@ EXPORT_SYMBOL_GPL(kthread_unpark);
  * Returns 0 if the thread is parked, -ENOSYS if the thread exited.
  * If called by the kthread itself just the park bit is set.
  */
+/*
+ * park一个内核线程（由kthread_create创建），park机制实现了线程暂时停止（挂起），
+ * 在合适的时间还可以再次启用，由cpu热插拔机制引入，引入的原因：
+ * 因为当一个cpu被下线时，需要将该cpu上的所有线程，资源等需要进行清理，早期的内核针对
+ * 绑核的per-cpu线程的做法是执行kthread_stop退出处理，当cpu上线时，在重新创建一次。
+ * 而park机制是另外一种对内核线程停止的机制，对一个线程进行park后，内核线程不会真的退出。
+ * 而是进入park状态，相当于线程暂时挂起运行，所以不会销毁线程资源。
+ * 当对线程进行unpark操作时，线程会恢复运行。经常用于cpu hotplug操作。
+ * park机制有效的避免进程退出/创建的开销。
+ */
 int kthread_park(struct task_struct *k)
 {
 	struct kthread *kthread = to_live_kthread(k);
 	int ret = -ENOSYS;
 
 	if (kthread) {
+		/* 如果线程已经PARK，函数直接返回 */
 		if (!test_bit(KTHREAD_IS_PARKED, &kthread->flags)) {
+			/* 如果线程没有PARK，设置KTHREAD_SHOULD_PARK位，用于通知线程需要park了 */
 			set_bit(KTHREAD_SHOULD_PARK, &kthread->flags);
 			if (k != current) {
+				/* 唤醒线程，去处理park事件 */
 				wake_up_process(k);
+				/* 阻塞，等待park完成 */
 				wait_for_completion(&kthread->parked);
 			}
 		}
