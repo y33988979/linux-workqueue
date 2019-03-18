@@ -125,11 +125,17 @@ enum {
 						/* call for help after 10ms
 						   (min two ticks) */
 	MAYDAY_INTERVAL		= HZ / 10,	/* and then every 100ms */
+	/* 
+	 * 并发管理：创建kworker失败的情况下，再次重试创建的间隔时间
+	 */
 	CREATE_COOLDOWN		= HZ,		/* time to breath after fail */
 
 	/*
 	 * Rescue workers are used only on emergencies and shared by
 	 * all cpus.  Give MIN_NICE.
+	 */
+	/*
+	 * 在内存紧张的情况下，救援线程会被使用，给予MIN_NICE优先级
 	 */
 	RESCUER_NICE_LEVEL	= MIN_NICE,
 	HIGHPRI_NICE_LEVEL	= MIN_NICE,
@@ -2352,6 +2358,9 @@ static void idle_worker_timeout(unsigned long __pool)
 	spin_unlock_irq(&pool->lock);
 }
 
+/*
+ * 向rescuer线程信号，唤醒rescuer任务。
+ */
 static void send_mayday(struct work_struct *work)
 {
 	struct pool_workqueue *pwq = get_work_pwq(work);
@@ -2359,6 +2368,7 @@ static void send_mayday(struct work_struct *work)
 
 	lockdep_assert_held(&wq_mayday_lock);
 
+	/* 如果wq没有WQ_MEM_RECLAIM标记，则不支持rescuer线程，直接返回 */
 	if (!wq->rescuer)
 		return;
 
@@ -2371,10 +2381,14 @@ static void send_mayday(struct work_struct *work)
 		 */
 		get_pwq(pwq);
 		list_add_tail(&pwq->mayday_node, &wq->maydays);
+		/* 唤醒rescuer后台线程 */
 		wake_up_process(wq->rescuer->task);
 	}
 }
 
+/*
+ * mayday_timer定时器处理函数，用于处理create_worker超时事件
+ */
 static void pool_mayday_timeout(unsigned long __pool)
 {
 	struct worker_pool *pool = (void *)__pool;
@@ -2390,6 +2404,12 @@ static void pool_mayday_timeout(unsigned long __pool)
 		 * allocation deadlock.  Send distress signals to
 		 * rescuers.
 		 */
+		/*
+		 * 走到这里，说明我们尝试创建了多次worker，都没有成功。
+		 * 很有可能工作任务调用在内存回收路径上，这种情况下，
+		 * 可能会导致死锁。所以我们向rescuers线程发送求救信号。
+		 * 将工作任务转交给rescuers线程来处理。
+		 */
 		list_for_each_entry(work, &pool->worklist, entry)
 			send_mayday(work);
 	}
@@ -2397,6 +2417,10 @@ static void pool_mayday_timeout(unsigned long __pool)
 	spin_unlock(&wq_mayday_lock);
 	spin_unlock_irq(&pool->lock);
 
+	/*
+	 * MAYDAY_INTERVAL = HZ / 10   //and then every 100ms
+	 * 更新定时器，每100ms在执行一次
+	 */
 	mod_timer(&pool->mayday_timer, jiffies + MAYDAY_INTERVAL);
 }
 
@@ -2426,14 +2450,30 @@ restart:
 	spin_unlock_irq(&pool->lock);
 
 	/* if we don't make progress in MAYDAY_INITIAL_TIMEOUT, call for help */
+	/*
+	 * MAYDAY_INITIAL_TIMEOUT  = HZ / 100 >= 2 ? HZ / 100 : 2,
+	 * 启动定时器，时间为1/100秒，也就是10ms，最小为2个tick
+	 */
 	mod_timer(&pool->mayday_timer, jiffies + MAYDAY_INITIAL_TIMEOUT);
 
 	while (true) {
+		/*
+		 * 如果create_worker返回空，则说明kworker没有创建成功
+		 * 可能是内存不足导致，这时再判断一次是否还需要创建kworker
+		 * 因为很有可能之前忙于工作的worker已经空闲，或者已经开始
+		 * 处理新任务，这种情况下，就不需要再创建新kworker了，退出
+		 * 循环。如果仍需要创建新worker，则继续循环，间隔一小段时间，
+		 * 再次尝试创建worker。
+		 */
 		if (create_worker(pool) || !need_to_create_worker(pool))
 			break;
 
+		/* 休息1s，再次尝试 */
 		schedule_timeout_interruptible(CREATE_COOLDOWN);
 
+		/*
+		 * 1s后再次检查是否需要创建新worker，避免不必要开销(创建新worker) 
+		 */
 		if (!need_to_create_worker(pool))
 			break;
 	}
