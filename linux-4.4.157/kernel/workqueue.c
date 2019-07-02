@@ -591,6 +591,10 @@ static void workqueue_sysfs_unregister(struct workqueue_struct *wq);
 #define CREATE_TRACE_POINTS
 #include <trace/events/workqueue.h>
 
+/*
+ * 下面三个宏对mutex和rcu持锁进行判断，保证数据安全访问，
+ * 若没有持锁，内核给予报警提示
+ */
 #define assert_rcu_or_pool_mutex()					\
 	RCU_LOCKDEP_WARN(!rcu_read_lock_held() &&			\
 			 !lockdep_is_held(&wq_pool_mutex),		\
@@ -607,6 +611,9 @@ static void workqueue_sysfs_unregister(struct workqueue_struct *wq);
 			 !lockdep_is_held(&wq_pool_mutex),		\
 			 "RCU, wq->mutex or wq_pool_mutex should be held")
 
+/* 
+ * 遍历对应cpu上的所有work_pool 
+ */
 #define for_each_cpu_worker_pool(pool, cpu)				\
 	for ((pool) = &per_cpu(cpu_worker_pools, cpu)[0];		\
 	     (pool) < &per_cpu(cpu_worker_pools, cpu)[NR_STD_WORKER_POOLS]; \
@@ -624,6 +631,9 @@ static void workqueue_sysfs_unregister(struct workqueue_struct *wq);
  * The if/else clause exists only for the lockdep assertion and can be
  * ignored.
  */
+/* 
+ * 遍历系统内所有work_pool 
+ */
 #define for_each_pool(pool, pi)						\
 	idr_for_each_entry(&worker_pool_idr, pool, pi)			\
 		if (({ assert_rcu_or_pool_mutex(); false; })) { }	\
@@ -638,6 +648,9 @@ static void workqueue_sysfs_unregister(struct workqueue_struct *wq);
  *
  * The if/else clause exists only for the lockdep assertion and can be
  * ignored.
+ */
+/* 
+ * 遍历给定pool中所有worker 
  */
 #define for_each_pool_worker(worker, pool)				\
 	list_for_each_entry((worker), &(pool)->workers, node)		\
@@ -656,11 +669,21 @@ static void workqueue_sysfs_unregister(struct workqueue_struct *wq);
  * The if/else clause exists only for the lockdep assertion and can be
  * ignored.
  */
+/*
+ * 遍历给定wq的所有pwq 
+ */
 #define for_each_pwq(pwq, wq)						\
 	list_for_each_entry_rcu((pwq), &(wq)->pwqs, pwqs_node)		\
 		if (({ assert_rcu_or_wq_mutex(wq); false; })) { }	\
 		else
 
+/*
+ * 打入rt补丁后台，当在某些函数中，要添加加额外的锁保护。
+ * 这里定义rt_lock_idle_list 和 sched_lock_idle_list，应用于
+ * wq_worker_sleeping/worker_enter_idle/worker_leave_idle/
+ * wake_up_worker函数中。
+ *
+ */
 #ifdef CONFIG_PREEMPT_RT_BASE
 static inline void rt_lock_idle_list(struct worker_pool *pool)
 {
@@ -685,11 +708,83 @@ static inline void sched_unlock_idle_list(struct worker_pool *pool)
 }
 #endif
 
-
+/*
+ * 用于跟踪work_struct的存活周期。如果在work_struct活动期间，
+ * 其状态发生了状态变更，内核会通过debug_ojects机制对其进行检测，
+ * 不正确的状态会报告。同时/sys/kernel/debug/debug_objects/stats记录了状态信息。
+ *
+ * 一般很少用，需要内核开启CONFIG_DEBUG_OBJECT支持。
+ */
 #ifdef CONFIG_DEBUG_OBJECTS_WORK
 
 static struct debug_obj_descr work_debug_descr;
 
+/*
+ * 当检测到work_struct状态不对时，ODEBUG子系统会调用debug_hint进行错误报告，
+ * 这里一般将函数地址作为返回值，内核会报告错误时，打印函数地址。
+ * 如下，work_debug_hint函数返回work_struct结构的function。
+ * 
+ * 如下示例，对于已进入actived的work_struct又对work进行初始化，则会输出内核告警
+ * debug/debug_objects # cat /proc/version
+[   68.362751] ------------[ cut here ]------------
+[   68.364219] WARNING: CPU: 7 PID: 269 at lib/debugobjects.c:263 debug_print_object+0x87/0xb0()
+[   68.366220] ODEBUG: init active (active state 0) object type: work_struct hint: work_func1+0x0/0x50
+[   68.366220] Modules linked in:
+[   68.366220] CPU: 7 PID: 269 Comm: cat Not tainted 4.4.157-rt174-CGEL-V6.02.10.R2 #5
+[   68.366220] Hardware name: QEMU Standard PC (i440FX + PIIX, 1996), BIOS rel-1.11.0-0-g63451fca13-prebuilt.qemu-project.org 04/01/2014
+[   68.366220]  0000000000000000 ffff88003f2a7738 ffffffff813de868 ffff88003f2a7780
+[   68.366220]  ffffffff82039e12 ffff88003f2a7770 ffffffff81062282 ffff880034f5c190
+[   68.366220]  ffffffff82234220 ffffffff820e8acc ffff880034f5c190 ffffffff825baf40
+[   68.366220] Call Trace:
+[   68.366220]  [<ffffffff813de868>] dump_stack+0x59/0x81
+[   68.366220]  [<ffffffff81062282>] warn_slowpath_common+0x82/0xc0
+[   68.366220]  [<ffffffff8106230c>] warn_slowpath_fmt+0x4c/0x50
+[   68.366220]  [<ffffffff813fa127>] debug_print_object+0x87/0xb0
+[   68.366220]  [<ffffffff812475a0>] ? work_func2+0x30/0x30
+[   68.366220]  [<ffffffff813fa557>] __debug_object_init+0x257/0x450
+[   68.366220]  [<ffffffff812475a0>] ? work_func2+0x30/0x30
+[   68.366220]  [<ffffffff813fa766>] debug_object_init+0x16/0x20
+[   68.366220]  [<ffffffff81077ea9>] __init_work+0x19/0x30
+[   68.366220]  [<ffffffff812476ce>] version_proc_show+0xde/0x110
+[   68.366220]  [<ffffffff811f6b2a>] seq_read+0xca/0x370
+[   68.366220]  [<ffffffff811b53de>] ? __kmalloc+0x2e/0x230
+[   68.366220]  [<ffffffff8123da00>] ? proc_reg_write+0x70/0x70
+[   68.366220]  [<ffffffff8123da42>] proc_reg_read+0x42/0x70
+[   68.366220]  [<ffffffff811d31b5>] do_loop_readv_writev+0x75/0xa0
+[   68.366220]  [<ffffffff8123da00>] ? proc_reg_write+0x70/0x70
+[   68.366220]  [<ffffffff811d3e85>] do_readv_writev+0x1e5/0x200
+[   68.366220]  [<ffffffff811d3ed6>] vfs_readv+0x36/0x50
+[   68.366220]  [<ffffffff812044f3>] default_file_splice_read+0x263/0x370
+[   68.366220]  [<ffffffff81202bd0>] ? page_cache_pipe_buf_release+0x20/0x20
+[   68.366220]  [<ffffffff81167473>] ? __alloc_pages_nodemask+0x173/0xab0
+[   68.366220]  [<ffffffff811b52fa>] ? kmem_cache_alloc_trace+0x1ba/0x1e0
+[   68.366220]  [<ffffffff811f6e00>] ? seq_release+0x30/0x30
+[   68.366220]  [<ffffffff811f742a>] ? seq_open+0x5a/0xa0
+[   68.366220]  [<ffffffff812475f0>] ? work_func1+0x50/0x50
+[   68.366220]  [<ffffffff811f74d1>] ? single_open+0x61/0xb0
+[   68.366220]  [<ffffffff811b52fa>] ? kmem_cache_alloc_trace+0x1ba/0x1e0
+[   68.366220]  [<ffffffff81202fb9>] do_splice_to+0x69/0x80
+[   68.366220]  [<ffffffff81203079>] splice_direct_to_actor+0xa9/0x1e0
+[   68.366220]  [<ffffffff81202b00>] ? generic_pipe_buf_nosteal+0x10/0x10
+[   68.366220]  [<ffffffff8120323f>] do_splice_direct+0x8f/0xb0
+[   68.366220]  [<ffffffff811d44d9>] do_sendfile+0x199/0x370
+[   68.366220]  [<ffffffff811d4ff3>] SyS_sendfile64+0x93/0xb0
+[   68.366220]  [<ffffffff810ca3d5>] ? __trace_hardirqs_off+0x15/0x20
+[   68.366220]  [<ffffffff81b9a04e>] entry_SYSCALL_64_fastpath+0x22/0x92
+[   68.366220] ---[ end trace 1ec556709a6e01e1 ]---
+[   68.424076] work_func1 14: cpu = 7
+Linux version 4.4.157-rt174-CGEL-V6.02.10.R2 (yuchen@localhost.localdomain) (gcc version 6.2.0 (ZTE Embsys-TSP V3.07.20) ) #5 SMP PREEM9
+/debug/debug_objects #
+/debug/debug_objects # cat stats
+max_chain     :15
+warnings      :1
+fixups        :1
+pool_free     :256
+pool_min_free :255
+pool_used     :1237
+pool_max_used :1238
+ *
+ */
 static void *work_debug_hint(void *addr)
 {
 	return ((struct work_struct *) addr)->func;
@@ -699,12 +794,19 @@ static void *work_debug_hint(void *addr)
  * fixup_init is called when:
  * - an active object is initialized
  */
+/*
+ * 一个work_struct已经激活后，又对其重新初始化，下面函数会被ODEBUG子系统调用，
+ * 对work进行fixup。
+ */
 static int work_fixup_init(void *addr, enum debug_obj_state state)
 {
 	struct work_struct *work = addr;
 
 	switch (state) {
 	case ODEBUG_STATE_ACTIVE:
+		/* 
+		 * 如果work已经是active状态，这里取消work的执行，防止work执行异常 
+		 */
 		cancel_work_sync(work);
 		debug_object_init(work, &work_debug_descr);
 		return 1;
@@ -717,6 +819,10 @@ static int work_fixup_init(void *addr, enum debug_obj_state state)
  * fixup_activate is called when:
  * - an active object is activated
  * - an unknown object is activated (might be a statically initialized object)
+ */
+/*
+ * 一个work_struct已经激活后，又对其进行激活，下面函数会被ODEBUG子系统调用，
+ * 进行fixup。
  */
 static int work_fixup_activate(void *addr, enum debug_obj_state state)
 {
