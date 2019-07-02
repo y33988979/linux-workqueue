@@ -836,6 +836,10 @@ static int work_fixup_activate(void *addr, enum debug_obj_state state)
 		 * statically initialized. We just make sure that it
 		 * is tracked in the object tracker.
 		 */
+		/*
+		 * 进入这个分支，说明work是以静态方式定义的，
+		 * 静态定义的work会置位WORK_STRUCT_STATIC_BIT
+		 */
 		if (test_bit(WORK_STRUCT_STATIC_BIT, work_data_bits(work))) {
 			debug_object_init(work, &work_debug_descr);
 			debug_object_activate(work, &work_debug_descr);
@@ -845,6 +849,9 @@ static int work_fixup_activate(void *addr, enum debug_obj_state state)
 		return 0;
 
 	case ODEBUG_STATE_ACTIVE:
+		/*
+		 * 重复active会输出warning
+		 */
 		WARN_ON(1);
 
 	default:
@@ -856,12 +863,20 @@ static int work_fixup_activate(void *addr, enum debug_obj_state state)
  * fixup_free is called when:
  * - an active object is freed
  */
+/*
+ * 尝试对一个已激活的work_struct进行free，下面函数会被ODEBUG子系统调用，
+ * 进行fixup。
+ * 内核中大部分work都是全局变量，所以一般不会对其销毁。
+ */
 static int work_fixup_free(void *addr, enum debug_obj_state state)
 {
 	struct work_struct *work = addr;
 
 	switch (state) {
 	case ODEBUG_STATE_ACTIVE:
+		/*
+		 * 先取消任务，在释放object
+		 */
 		cancel_work_sync(work);
 		debug_object_free(work, &work_debug_descr);
 		return 1;
@@ -870,6 +885,9 @@ static int work_fixup_free(void *addr, enum debug_obj_state state)
 	}
 }
 
+/*
+ * 为work_struct结构，定义debug_object子系统，用于object对象的生命期跟踪
+ */
 static struct debug_obj_descr work_debug_descr = {
 	.name		= "work_struct",
 	.debug_hint	= work_debug_hint,
@@ -878,16 +896,28 @@ static struct debug_obj_descr work_debug_descr = {
 	.fixup_free	= work_fixup_free,
 };
 
+/*
+ * 对work项设置active状态，在workqueue的实现中，
+ * 当一个工作项被添加到worklist时，会被置为active状态
+ */
 static inline void debug_work_activate(struct work_struct *work)
 {
 	debug_object_activate(work, &work_debug_descr);
 }
 
+/*
+ * 对work项设置deactive状态，在workqueue的实现中，
+ * 当一个工作项将要被执行时（从队列中摘下）会被置为deactive状态
+ */
 static inline void debug_work_deactivate(struct work_struct *work)
 {
 	debug_object_deactivate(work, &work_debug_descr);
 }
 
+/*
+ * 当对work_struct初始化时会被调用，该函数主要目的是对debug_object对象初始化。
+ * 用于work项的生命期跟踪。
+ */
 void __init_work(struct work_struct *work, int onstack)
 {
 	if (onstack)
@@ -897,12 +927,21 @@ void __init_work(struct work_struct *work, int onstack)
 }
 EXPORT_SYMBOL_GPL(__init_work);
 
+/*
+ * 当一个工作项在栈上面使用时，需要使用下面接口来销毁对象
+ * 因为开启ODEBUG系统后，需要跟踪对象free的状态，并将object
+ * 从ODEBUG系统中移除，所以销毁work_struct时，
+ * 需要调用debug_object_free处理。
+ */
 void destroy_work_on_stack(struct work_struct *work)
 {
 	debug_object_free(work, &work_debug_descr);
 }
 EXPORT_SYMBOL_GPL(destroy_work_on_stack);
 
+/*
+ * 和destroy_work_on_stack一样，需要销毁object对象
+ */
 void destroy_delayed_work_on_stack(struct delayed_work *work)
 {
 	destroy_timer_on_stack(&work->timer);
@@ -911,6 +950,10 @@ void destroy_delayed_work_on_stack(struct delayed_work *work)
 EXPORT_SYMBOL_GPL(destroy_delayed_work_on_stack);
 
 #else
+/*
+ * 如果不开启CONFIG_DEBUG_OBJECT_WORK，就不需要跟踪work生命周期状态。
+ * debug_work_xxx相关函数为空
+ */
 static inline void debug_work_activate(struct work_struct *work) { }
 static inline void debug_work_deactivate(struct work_struct *work) { }
 #endif
@@ -922,10 +965,16 @@ static inline void debug_work_deactivate(struct work_struct *work) { }
  * Returns 0 if ID in [0, WORK_OFFQ_POOL_NONE) is allocated and assigned
  * successfully, -errno on failure.
  */
+/*
+ * 为work_pool申请一个id，这里调用了idr子系统来申请id。
+ */
 static int worker_pool_assign_id(struct worker_pool *pool)
 {
 	int ret;
 
+	/*
+	 * 一般操作work_pool中的成员，都要加锁保护，这里为lockdep假定持锁判断
+	 */
 	lockdep_assert_held(&wq_pool_mutex);
 
 	ret = idr_alloc(&worker_pool_idr, pool, 0, WORK_OFFQ_POOL_NONE,
@@ -1300,6 +1349,14 @@ static bool keep_working(struct worker_pool *pool)
  * 
  * 所以，若满足以上3个条件，返回true，表示需要创建新的worker。
  * 该函数被work manager调用。
+ *
+ * need_more_worker() == true && pool->nr_idle == 0 意味着，所有的worker均正在
+ * 处理work但是都进入了阻塞状态。所以此时必须要创建额外的worker来处理新的work。
+ * 如果pool->nr_idle == 0，但need_more_worker() == false，表示所有worker处于忙
+ * 状态，但个别worker并没有阻塞，nr_running>0，正在执行work的function，应该很快
+ * 会处理完成，处理完成后即可处理新的任务，而如果处理的work执行时间过长导致新的
+ * work无法执行，请考虑使用WQ_CPU_INTENSIVE队列。work处理时间过长意味着该任务是
+ * cpu消耗型的。  
  */
 static bool need_to_create_worker(struct worker_pool *pool)
 {
@@ -1394,6 +1451,7 @@ void wq_worker_running(struct task_struct *task)
 {
 	struct worker *worker = kthread_data(task);
 
+	/* worker已经在运行，直接返回 */
 	if (!worker->sleeping)
 		return;
 	if (!(worker->flags & WORKER_NOT_RUNNING))
@@ -1406,6 +1464,15 @@ void wq_worker_running(struct task_struct *task)
  * @task: task going to sleep
  * This function is called from schedule() when a busy worker is
  * going to sleep.
+ */
+/*
+ * 函数说明：
+ * 标识worker任务进入sleeping状态，该函数由schedule()函数调用。
+ * 也就是在worker在空闲时，执行schedule()时调用。 
+ * 
+ * 函数实现：
+ * 递减worker pool中的running worker个数
+ * worker->pool->nr_running--;
  */
 void wq_worker_sleeping(struct task_struct *task)
 {
@@ -1540,12 +1607,18 @@ static struct worker *find_worker_executing_work(struct worker_pool *pool,
 {
 	struct worker *worker;
 
+	/* 
+	 * busy任务存放在哈希表中，这里遍历哈希表，如果worker的current_work
+	 * 指针和current_func指针和work匹配，则说明该工作项正在执行。
+	 * worker的这2个指针，在process_one_work中赋值，work处理完毕后，
+	 * current_work指针和current_func指针会被置为NULL。
 	hash_for_each_possible(pool->busy_hash, worker, hentry,
 			       (unsigned long)work)
 		if (worker->current_work == work &&
 		    worker->current_func == work->func)
 			return worker;
 
+	/* 如果没有找到正在执行的任务，返回NULL */
 	return NULL;
 }
 
