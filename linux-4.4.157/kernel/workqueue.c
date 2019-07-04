@@ -375,6 +375,9 @@ struct pool_workqueue {
 /*
  * Structure used to wait for workqueue flush.
  */
+/*
+ * 用来等待一个workqueue队列上所有work项被flush
+ */
 struct wq_flusher {
 	struct list_head	list;		/* WQ: list of flushers */
 	int			flush_color;	/* WQ: flush color waiting for */
@@ -528,7 +531,7 @@ static cpumask_var_t wq_unbound_cpumask; /* PL: low level cpumask for all unboun
 static DEFINE_PER_CPU_SHARED_ALIGNED(struct worker_pool [NR_STD_WORKER_POOLS],
 				     cpu_worker_pools);
 
-/* worker_pool的ID，这里使用idr_alloc来分配pool的id */
+/* 定义worker_pool的Idr结构，后面会通过idr_alloc来分配pool的id */
 static DEFINE_IDR(worker_pool_idr);	/* PR: idr of all pools */
 
 /* PL: hash of all unbound pools keyed by pool->attrs */
@@ -977,6 +980,9 @@ static int worker_pool_assign_id(struct worker_pool *pool)
 	 */
 	lockdep_assert_held(&wq_pool_mutex);
 
+	/*
+	 * 通过idr子系统申请id，idr可以提高查找速度。
+	 */
 	ret = idr_alloc(&worker_pool_idr, pool, 0, WORK_OFFQ_POOL_NONE,
 			GFP_KERNEL);
 	if (ret >= 0) {
@@ -998,11 +1004,20 @@ static int worker_pool_assign_id(struct worker_pool *pool)
  *
  * Return: The unbound pool_workqueue for @node.
  */
+/*
+ * 通过指定的workqueue_struct和node id查找pool_workqueue，
+ *
+ * 通常：
+ * 当CONFIG_NUMA=n时，node=NUMA_NO_NODE，
+ * 当CONFIG_NUMA=y，但系统不满足NUMA架构（多CPU共享一块内存），node=0
+ * 当CONFIG_NUMA=y，且系统满足NUMA架构，node等于对应节点id
+ */
 static struct pool_workqueue *unbound_pwq_by_node(struct workqueue_struct *wq,
 						  int node)
 {
 	assert_rcu_or_wq_mutex_or_pool_mutex(wq);
 
+	//printk("%s %d: node=%d\n", __func__,__LINE__,node);
 	/*
 	 * XXX: @node can be NUMA_NO_NODE if CPU goes offline while a
 	 * delayed item is pending.  The plan is to keep CPU -> NODE
@@ -1169,14 +1184,29 @@ static struct worker_pool *get_work_pool(struct work_struct *work)
 
 	assert_rcu_or_pool_mutex();
 
+	/*
+	 * 如果work项已经被queued（还没有被执行)，work->data会置%WORK_STRUCT_PWQ位
+	 * work->data中保存了pwq指针。这里直接通过pwq返回对应的pool
+	 */
 	if (data & WORK_STRUCT_PWQ)
 		return ((struct pool_workqueue *)
 			(data & WORK_STRUCT_WQ_DATA_MASK))->pool;
 
+	/*
+	 * 当work项从队里上摘下，data的高位会保存上一次处理它的pool_id，
+	 * 如果work项的pool_id等于WORK_OFFQ_POOL_NONE，说明没有关联任何pool
+	 * WORK_OFFQ_POOL_NONE是一个最大值，当一个work被初始化时，
+	 * work->data会默认赋值WORK_OFFQ_POOL_NONE，see %WORK_DATA_INIT()
+	 *
+	 * 返回NULL说明一个工作项还没有被queue过，或者已经被取消。
+	 */
 	pool_id = data >> WORK_OFFQ_POOL_SHIFT;
 	if (pool_id == WORK_OFFQ_POOL_NONE)
 		return NULL;
 
+	/*
+	 * 通过idr查找对应的pool，并返回。
+	 */
 	return idr_find(&worker_pool_idr, pool_id);
 }
 
@@ -1612,6 +1642,7 @@ static struct worker *find_worker_executing_work(struct worker_pool *pool,
 	 * 指针和current_func指针和work匹配，则说明该工作项正在执行。
 	 * worker的这2个指针，在process_one_work中赋值，work处理完毕后，
 	 * current_work指针和current_func指针会被置为NULL。
+	 */
 	hash_for_each_possible(pool->busy_hash, worker, hentry,
 			       (unsigned long)work)
 		if (worker->current_work == work &&
@@ -1815,6 +1846,10 @@ out_put:
  *
  * This function is safe to call from any context including IRQ handler.
  */
+/*
+ * 尝试去偷取一个PENDING的work项，该接口主要用于work队列的转移，或者work的取消。
+ * 通常在取消一个工作项，或者将work项转移到会被调用。
+ */
 static int try_to_grab_pending(struct work_struct *work, bool is_dwork,
 			       unsigned long *flags)
 {
@@ -1836,6 +1871,9 @@ static int try_to_grab_pending(struct work_struct *work, bool is_dwork,
 			return 1;
 	}
 
+	/*
+	 * 如果一个work没有PENDING，直接返回0，表示无法grab
+	 */
 	/* try to claim PENDING the normal way */
 	if (!test_and_set_bit(WORK_STRUCT_PENDING_BIT, work_data_bits(work)))
 		return 0;
@@ -1907,7 +1945,8 @@ fail:
  */
 /*
  * 函数说明：
- * 添加一个work任务到指定的pool->worklist。
+ * 添加一个work任务到指定list中，
+ * 一般的work项会加入到的pool->worklist, barrier work会加入到worker->schedule list中。
  */
 static void insert_work(struct pool_workqueue *pwq, struct work_struct *work,
 			struct list_head *head, unsigned int extra_flags)
@@ -1921,7 +1960,7 @@ static void insert_work(struct pool_workqueue *pwq, struct work_struct *work,
 	 * 详见：set_work_pwq, set_work_data
 	 */
 	set_work_pwq(work, pwq, extra_flags);
-	/* 添加work到pool->worklist */
+	/* 添加work到worklist */
 	list_add_tail(&work->entry, head);
 	/* 增加引用计数 pwq->refcnt++ */
 	get_pwq(pwq);
@@ -3100,12 +3139,30 @@ repeat:
 	goto repeat;
 }
 
+/*
+ * workqueue同步的结构体，工作项的flush操作会被使用。
+ *
+ */
 struct wq_barrier {
+	/*
+	 * barrier工作项，该工作项会插入到被等待任务的后面。
+	 * 用于等待前面的work项工作完成。
+	 */
 	struct work_struct	work;
+	/*
+	 * 当worker处理完成barrier工作项，会唤醒调用flush_work的进程
+	 */
 	struct completion	done;
+	/*
+	 * 记录那个阻塞进程（调用flush_work的那个task）
+	 */
 	struct task_struct	*task;	/* purely informational */
 };
 
+/*
+ * barrier工作项的function，当barrier work被调度完成执行，说明被flush的work
+ * 已经完成执行。这里唤醒等待线程。
+ */
 static void wq_barrier_func(struct work_struct *work)
 {
 	struct wq_barrier *barr = container_of(work, struct wq_barrier, work);
@@ -3158,9 +3215,18 @@ static void insert_wq_barrier(struct pool_workqueue *pwq,
 	 * If @target is currently being executed, schedule the
 	 * barrier to the worker; otherwise, put it after @target.
 	 */
+	/*
+	 * 如果worker不为NULL，说明工作项正在此worker上运行，
+	 * 将barrier插入到scheduled列表里。
+	 */
 	if (worker)
 		head = worker->scheduled.next;
 	else {
+		
+		/*
+		 * 如果worker为NULL，说明work项还没有投入运行，将barrier直接
+		 * 插入到work项之后。
+		 */
 		unsigned long *bits = work_data_bits(target);
 
 		head = target->entry.next;
@@ -3169,7 +3235,13 @@ static void insert_wq_barrier(struct pool_workqueue *pwq,
 		__set_bit(WORK_STRUCT_LINKED_BIT, bits);
 	}
 
+	/*
+	 * 设置work项为active， for ODEBUG 
+	 */
 	debug_work_activate(&barr->work);
+	/*
+	 * 将work项插入到合适的list，并唤醒work_pool。
+	 */
 	insert_work(pwq, &barr->work, head,
 		    work_color_to_flags(WORK_NO_COLOR) | linked);
 }
@@ -3251,6 +3323,11 @@ static bool flush_workqueue_prep_pwqs(struct workqueue_struct *wq,
  *
  * This function sleeps until all work items which were queued on entry
  * have finished execution, but it is not livelocked by new incoming ones.
+ */
+/*
+ * 等待一个workqueue队列上的所有work项执行完成。
+ * 与drain_workqueue不同点是：drain期间不允许有new work被queue入。
+ * 而flush_workqueue期间，不会阻碍new work的到来。
  */
 void flush_workqueue(struct workqueue_struct *wq)
 {
@@ -3409,6 +3486,11 @@ EXPORT_SYMBOL(flush_workqueue);
  * by the depth of chaining and should be relatively short.  Whine if it
  * takes too long.
  */
+/*
+ * 等待一个workqueue队列上的所有work项全部处理完成，
+ * 在等待过程中，该接口会阻塞，并对wq设置__WQ_DRAINING标记，
+ * 防止在drain期间，仍有人向wq队列投递任务。(仅chailed work是被允许的)
+ */
 void drain_workqueue(struct workqueue_struct *wq)
 {
 	unsigned int flush_cnt = 0;
@@ -3435,6 +3517,9 @@ reflush:
 		drained = !pwq->nr_active && list_empty(&pwq->delayed_works);
 		spin_unlock_irq(&pwq->pool->lock);
 
+		/*
+		 * 如果pwq上的work项全部执行完成，则遍历下一个pwq
+		 */
 		if (drained)
 			continue;
 
@@ -3453,6 +3538,9 @@ reflush:
 }
 EXPORT_SYMBOL_GPL(drain_workqueue);
 
+/*
+ * flush work的准备工作，主要功能为：将barrier work插入到被等待work之后。
+ */
 static bool start_flush_work(struct work_struct *work, struct wq_barrier *barr)
 {
 	struct worker *worker = NULL;
@@ -3462,19 +3550,32 @@ static bool start_flush_work(struct work_struct *work, struct wq_barrier *barr)
 	might_sleep();
 
 	rcu_read_lock();
+	/*
+	 * 获取上一次work执行的pool
+	 */
 	pool = get_work_pool(work);
 	if (!pool) {
+		/*
+		 * NULL pool 说明work没有被queued，或者已取消。
+		 */
 		rcu_read_unlock();
 		return false;
 	}
 
 	spin_lock_irq(&pool->lock);
 	/* see the comment in try_to_grab_pending() with the same code */
+	/*
+	 * 尝试获取pwq指针，如果pwq不为NULL，说明work已经被insert，但没有得到调度
+	 * 得到调度后work->data会存储poo_id，覆盖了data的高bit位，pwq变为NULL
+	 */
 	pwq = get_work_pwq(work);
 	if (pwq) {
 		if (unlikely(pwq->pool != pool))
 			goto already_gone;
 	} else {
+		/*
+		 * 查看work项是否正在running，如果没有运行，那么就无法跟踪了。
+		 */
 		worker = find_worker_executing_work(pool, work);
 		if (!worker)
 			goto already_gone;
@@ -3514,6 +3615,13 @@ already_gone:
  * %true if flush_work() waited for the work to finish execution,
  * %false if it was already idle.
  */
+/*
+ * 用于等待一个工作项执行完成。
+ *
+ * 1、如果工作项已经执行完毕，接口立即返回false。
+ * 2、如果工作项尚未得到执行，该接口会阻塞，待工作项执行完毕后，返回true。
+ *
+ */
 bool flush_work(struct work_struct *work)
 {
 	struct wq_barrier barr;
@@ -3521,7 +3629,11 @@ bool flush_work(struct work_struct *work)
 	lock_map_acquire(&work->lockdep_map);
 	lock_map_release(&work->lockdep_map);
 
+	/*
+	 * wq_barrier结构用于进程同步，使用completion机制
+	 */
 	if (start_flush_work(work, &barr)) {
+		/* 等待kworker唤醒当前进程 */
 		wait_for_completion(&barr.done);
 		destroy_work_on_stack(&barr.work);
 		return true;
@@ -4086,6 +4198,11 @@ static void pwq_unbound_release_workfn(struct work_struct *work)
  * workqueue's saved_max_active and activate delayed work items
  * accordingly.  If @pwq is freezing, clear @pwq->max_active to zero.
  */
+/*
+ * 调整pwq的max_active，也就是work项的最大激活数，当队列被冻结时，
+ * pwq->max_active被调整为0；解冻后，max_active重新恢复为saved_max_active
+ * 
+ */
 static void pwq_adjust_max_active(struct pool_workqueue *pwq)
 {
 	struct workqueue_struct *wq = pwq->wq;
@@ -4108,6 +4225,9 @@ static void pwq_adjust_max_active(struct pool_workqueue *pwq)
 	if (!freezable || !workqueue_freezing) {
 		pwq->max_active = wq->saved_max_active;
 
+		/*
+		 * 解冻后，将delayed_works中的wroks转移到pool->worklist中
+		 */
 		while (!list_empty(&pwq->delayed_works) &&
 		       pwq->nr_active < pwq->max_active)
 			pwq_activate_first_delayed(pwq);
@@ -4926,6 +5046,9 @@ unsigned int work_busy(struct work_struct *work)
 	unsigned long flags;
 	unsigned int ret = 0;
 
+	/*
+	 * 一个work项被queue后，会置为PENDING状态。
+	 */
 	if (work_pending(work))
 		ret |= WORK_BUSY_PENDING;
 
@@ -4933,6 +5056,9 @@ unsigned int work_busy(struct work_struct *work)
 	pool = get_work_pool(work);
 	if (pool) {
 		spin_lock_irqsave(&pool->lock, flags);
+		/*
+		 * 如果work处于running状态，额外添加BUSY_RUNNING标志
+		 */
 		if (find_worker_executing_work(pool, work))
 			ret |= WORK_BUSY_RUNNING;
 		spin_unlock_irqrestore(&pool->lock, flags);
@@ -5624,6 +5750,9 @@ void freeze_workqueues_begin(void)
  * %true if some freezable workqueues are still busy.  %false if freezing
  * is complete.
  */
+/*
+ * 判断一个冻结的workqueue是否仍有任务处于busy状态。
+ */
 bool freeze_workqueues_busy(void)
 {
 	bool busy = false;
@@ -5644,6 +5773,10 @@ bool freeze_workqueues_busy(void)
 		rcu_read_lock();
 		for_each_pwq(pwq, wq) {
 			WARN_ON_ONCE(pwq->nr_active < 0);
+			/*
+			 * 被激活的work项数目大于0，则说明wq上仍有未处理的任务
+			 * 置为busy状态。
+			 */
 			if (pwq->nr_active) {
 				busy = true;
 				rcu_read_unlock();
