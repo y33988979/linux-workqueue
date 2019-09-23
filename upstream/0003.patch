@@ -1,0 +1,107 @@
+On Sat, 21 Sep 2019 15:51:38, Russell King - ARM Linux admin wrote:
+> On Sat, Sep 21, 2019 at 09:02:49PM +0800, Yu Chen wrote:
+> > From: Yu Chen <yu.chen3@zte.com.cn> 
+> >  
+> > memblock reserved regions are not reported via /proc/iomem on ARM, kexec's
+> > user-space doesn't know about memblock_reserve()d regions and thus
+> > possible for kexec to overwrite with the new kernel or initrd.
+> 
+> Many reserved regions come from the kernel allocating memory during
+> boot.  We don't want to prevent kexec re-using those regions.
+> 
+> > [    0.000000] Booting Linux on physical CPU 0xf00
+> > [    0.000000] Linux version 4.9.115-rt93-dirty (yuchen@localhost.localdomain) (gcc version 6.2.0 (ZTE Embsys-TSP V3.07.2
+> > 0) ) #62 SMP PREEMPT Fri Sep 20 10:39:29 CST 2019
+> > [    0.000000] CPU: ARMv7 Processor [410fc075] revision 5 (ARMv7), cr=30c5387d
+> > [    0.000000] CPU: div instructions available: patching division code
+> > [    0.000000] CPU: PIPT / VIPT nonaliasing data cache, VIPT aliasing instruction cache
+> > [    0.000000] OF: fdt:Machine model: LS1021A TWR Board
+> > [    0.000000] INITRD: 0x80f7f000+0x03695e40 overlaps in-use memory region - disabling initrd
+> 
+> Is the overlapping region one that is marked as reserved in DT?
+
+the overlapping region is not reserved in DT.
+
+> Where is the reserved region that overlaps the initrd coming from?
+
+I found the reserved region that overlaps the initrd is kernel code & data, 
+with memblock=debug cmdline start new kerne:
+
+/ # kexec -l uImage-ls1021a --ramdisk=ramdisk-ls1021a --dtb=fdt --append="root=/
+dev/ram0 rw console=ttyS0,115200 earlyprintk memblock=debug" -d
+Try gzip decompression.
+Try LZMA decompression.
+lzma_decompress_file: read on uImage-ls1021a of 65536 bytes failed
+kernel: 0xb6c71008 kernel_size: 0x317ab8
+MEMORY RANGES
+0000000080000000-00000000bfffffff (0)
+0000000080003000-0000000080007fff (1)
+0000000080e00000-0000000080ffffff (1)
+00000000810c45a4-00000000810c4fff (1)
+0000000081ac4000-0000000085159fff (1)
+000000008515a000-000000008515ffff (1)
+0000000088000000-000000008b695fff (1)
+000000008f000000-000000008f004fff (1)
+00000000af709000-00000000af7eafff (1)
+00000000af7ed000-00000000afffbfff (1)
+00000000afffc000-00000000afffcfff (1)
+00000000afffd000-00000000afffffff (1)
+00000000bc000000-00000000bfffffff (1)
+zImage header: 0x016f2818 0x00000000 0x00317a78
+zImage size 0x317a78, file size 0x317a78
+kexec_load: entry = 0x80008000 flags = 0x280000
+nr_segments = 3
+segment[0].buf   = 0xb6c71048
+segment[0].bufsz = 0x317a78
+segment[0].mem   = 0x80008000
+segment[0].memsz = 0x318000
+segment[1].buf   = 0xb35db048
+segment[1].bufsz = 0x3695e40
+segment[1].mem   = 0x80f7f000
+segment[1].memsz = 0x3696000
+segment[2].buf   = 0x100b108
+segment[2].bufsz = 0x5090
+segment[2].mem   = 0x84615000
+segment[2].memsz = 0x6000
+/ # kexec -e
+[  126.583598] kexec_core: Starting new kernel
+[  126.587815] Disabling non-boot CPUs ...
+[  126.626917] CPU1: shutdown
+[  126.656344] Retrying again to check for CPU kill
+[  126.660947] CPU1 killed.
+[  126.687585] Bye!
+[    0.000000] Booting Linux on physical CPU 0xf00
+[    0.000000] Linux version 4.9.115-rt93-CGEL-V6.02.10.R4-dirty (yuchen@localhost.localdomain) (gcc version 6.2.0 (ZTE Embsys-TSP V3.07.20) ) #62 SMP PREEMPT Fri Sep 20 10:39:29 CST 2019
+[    0.000000] CPU: ARMv7 Processor [410fc075] revision 5 (ARMv7), cr=30c5387d
+[    0.000000] CPU: div instructions available: patching division code
+[    0.000000] CPU: PIPT / VIPT nonaliasing data cache, VIPT aliasing instruction cache
+[    0.000000] OF: fdt:Machine model: LS1021A TWR Board
+[    0.000000] memblock_reserve: [0x00000080200000-0x000000810c45a3] flags 0x0 arm_memblock_init+0x44/0x23c
+[    0.000000] INITRD: 0x80f7f000+0x03695e40 overlaps in-use memory region - disabling initrd
+[    0.000000] memblock_reserve: [0x00000080003000-0x00000080007fff] flags 0x0 arm_mm_memblock_reserve+0x2c/0x30
+[    0.000000] memblock_reserve: [0x00000084615000-0x0000008461a08f] flags 0x0 early_init_dt_reserve_memory_arch+0x24/0x28
+[    0.000000] memblock_reserve: [0x0000008f000000-0x0000008f004fff] flags 0x0 early_init_dt_reserve_memory_arch+0x24/0x28
+[    0.000000] memblock_reserve: [0x00000088000040-0x0000008b695e3f] flags 0x0 early_init_dt_reserve_memory_arch+0x24/0x28
+[    0.000000] memblock_reserve: [0x000000bc000000-0x000000bfffffff] flags 0x0 memblock_alloc_range_nid+0x78/0x90
+ ... 
+ ---[ end Kernel panic - not syncing: VFS: Unable to mount root fs on unknown-block(1,0)
+
+this overlay region is [0x00000080200000-0x000000810c45a3]
+
+Corresponding kernel source code:
+264 void __init arm_memblock_init(const struct machine_desc *mdesc)
+265 {
+266         /* Register the kernel text, kernel data and initrd with memblock. */
+267         memblock_reserve(__pa(KERNEL_START), KERNEL_END - KERNEL_START);
+
+> 
+> Thanks.
+> 
+> --  
+> RMK's Patch system: https://www.armlinux.org.uk/developer/patches/
+> FTTC broadband for 0.8mile line in suburbia: sync at 12.1Mbps down 622kbps up
+> According to speedtest.net: 11.9Mbps down 500kbps up
+
+And Sorry, I sent the wrong arm64 patch. if possible, I will resend the second version of the patch.
+
+Yu Chen
